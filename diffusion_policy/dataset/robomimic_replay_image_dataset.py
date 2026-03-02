@@ -23,7 +23,6 @@ from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import SequenceSampler, get_val_mask
 from diffusion_policy.common.normalize_util import (
     robomimic_abs_action_only_normalizer_from_stat,
-    robomimic_abs_action_only_dual_arm_normalizer_from_stat,
     get_range_normalizer_from_stat,
     get_image_range_normalizer,
     get_identity_normalizer_from_stat,
@@ -151,11 +150,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         # action
         stat = array_to_stats(self.replay_buffer['action'])
         if self.abs_action:
-            if stat['mean'].shape[-1] > 10:
-                # dual arm
-                this_normalizer = robomimic_abs_action_only_dual_arm_normalizer_from_stat(stat)
-            else:
-                this_normalizer = robomimic_abs_action_only_normalizer_from_stat(stat)
+            this_normalizer = robomimic_abs_action_only_normalizer_from_stat(stat)
             
             if self.use_legacy_normalizer:
                 this_normalizer = normalizer_from_stat(stat)
@@ -174,6 +169,8 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 # quaternion is in [-1,1] already
                 this_normalizer = get_identity_normalizer_from_stat(stat)
             elif key.endswith('qpos'):
+                this_normalizer = get_range_normalizer_from_stat(stat)
+            elif key == 'base_pose':
                 this_normalizer = get_range_normalizer_from_stat(stat)
             else:
                 raise RuntimeError('unsupported')
@@ -223,22 +220,13 @@ class RobomimicReplayImageDataset(BaseImageDataset):
 def _convert_actions(raw_actions, abs_action, rotation_transformer):
     actions = raw_actions
     if abs_action:
-        is_dual_arm = False
-        if raw_actions.shape[-1] == 14:
-            # dual arm
-            raw_actions = raw_actions.reshape(-1,2,7)
-            is_dual_arm = True
-
-        pos = raw_actions[...,:3]
-        rot = raw_actions[...,3:6]
-        gripper = raw_actions[...,6:]
+        pos = raw_actions[...,:6]
+        rot = raw_actions[...,6:9]
+        gripper = raw_actions[...,9:]
         rot = rotation_transformer.forward(rot)
         raw_actions = np.concatenate([
             pos, rot, gripper
         ], axis=-1).astype(np.float32)
-    
-        if is_dual_arm:
-            raw_actions = raw_actions.reshape(-1,20)
         actions = raw_actions
     return actions
 

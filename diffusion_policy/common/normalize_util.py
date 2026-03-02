@@ -110,8 +110,8 @@ def robomimic_abs_action_normalizer_from_stat(stat, rotation_transformer):
 def robomimic_abs_action_only_normalizer_from_stat(stat):
     result = dict_apply_split(
         stat, lambda x: {
-            'pos': x[...,:3],
-            'other': x[...,3:]
+            'pos': x[...,:6],
+            'other': x[...,6:]
     })
 
     def get_pos_param_info(stat, output_max=1, output_min=-1, range_eps=1e-7):
