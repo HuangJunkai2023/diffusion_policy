@@ -1,4 +1,4 @@
-name: sim-v1
+name: demos
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
