@@ -1,0 +1,32 @@
+name: uarm_er3pro_image
+
+image_shape: &image_shape [3, 240, 320]
+dataset_path: data/uarm_er3pro/uarm_er3pro_replay.zarr
+
+shape_meta: &shape_meta
+  obs:
+    base_image:
+      shape: *image_shape
+      type: rgb
+    wrist_image:
+      shape: *image_shape
+      type: rgb
+    robot_state:
+      shape: [15]
+      type: low_dim
+  action:
+    shape: [8]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.null_image_runner.NullImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.uarm_er3pro_image_dataset.UArmEr3ProImageDataset
+  zarr_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null

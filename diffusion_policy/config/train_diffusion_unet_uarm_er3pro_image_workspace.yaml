@@ -1,0 +1,50 @@
+defaults:
+  - train_diffusion_unet_real_image_workspace
+  - override task: uarm_er3pro_image
+  - _self_
+
+name: train_diffusion_unet_uarm_er3pro_image
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+
+dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  num_epochs: 600
+  gradient_accumulate_every: 1
+  use_ema: True
+  freeze_encoder: False
+  rollout_every: 1000000
+  checkpoint_every: 25
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_uarm_er3pro
+  resume: True
+  mode: disabled
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
