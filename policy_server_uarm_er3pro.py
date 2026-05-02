@@ -104,7 +104,7 @@ class UArmEr3ProDiffusionPolicy:
                     "arm_joints": act[:7].astype(np.float64),
                     "arm_pos": np.asarray(latest_obs["arm_pos"], dtype=np.float64).copy(),
                     "arm_quat": np.asarray(latest_obs["arm_quat"], dtype=np.float64).copy(),
-                    "gripper_pos": np.asarray(act[7:8], dtype=np.float64),
+                    "gripper_pos": np.asarray(np.clip(act[7:8], 0.0, 1.0), dtype=np.float64),
                 }
             )
         return act_sequence
