@@ -97,7 +97,12 @@ def read_video_frames(root: Path, episode: dict, video_key: str, size: tuple[int
     return np.asarray(frames, dtype=np.uint8)
 
 
-def collect_episodes(roots: list[Path], image_size: tuple[int, int]):
+def collect_episodes(
+    roots: list[Path],
+    image_size: tuple[int, int],
+    min_episode_frames: int = 2,
+    skip_bad_episodes: bool = True,
+):
     states = []
     actions = []
     base_images = []
@@ -115,15 +120,25 @@ def collect_episodes(roots: list[Path], image_size: tuple[int, int]):
 
         print(f"READ {root}: {len(episodes)} episodes, {info.get('total_frames')} frames")
         for episode in episodes:
-            state, action = read_data_rows(root, episode)
             length = int(episode["length"])
-            if len(state) != length or len(action) != length:
-                raise RuntimeError(
-                    f"{root} episode {episode['episode_index']} length mismatch: "
-                    f"meta={length} state={len(state)} action={len(action)}"
-                )
-            base = read_video_frames(root, episode, BASE_VIDEO_KEY, image_size, fps)
-            wrist = read_video_frames(root, episode, WRIST_VIDEO_KEY, image_size, fps)
+            episode_name = f"{root.name}/episode-{int(episode['episode_index']):06d}"
+            if length < min_episode_frames:
+                print(f"SKIP {episode_name}: length {length} < {min_episode_frames}")
+                continue
+
+            try:
+                state, action = read_data_rows(root, episode)
+                if len(state) != length or len(action) != length:
+                    raise RuntimeError(
+                        f"length mismatch: meta={length} state={len(state)} action={len(action)}"
+                    )
+                base = read_video_frames(root, episode, BASE_VIDEO_KEY, image_size, fps)
+                wrist = read_video_frames(root, episode, WRIST_VIDEO_KEY, image_size, fps)
+            except Exception as exc:
+                if skip_bad_episodes:
+                    print(f"SKIP {episode_name}: {exc}")
+                    continue
+                raise
 
             states.append(state)
             actions.append(action)
@@ -172,12 +187,19 @@ def main():
     parser.add_argument("--output", "-o", default="src/diffusion_policy/data/uarm_er3pro/uarm_er3pro_replay.zarr")
     parser.add_argument("--image-width", type=int, default=320)
     parser.add_argument("--image-height", type=int, default=240)
+    parser.add_argument("--min-episode-frames", type=int, default=2)
+    parser.add_argument("--skip-bad-episodes", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     roots = find_lerobot_roots(Path(args.input).expanduser())
     if not roots:
         raise RuntimeError(f"no LeRobot roots found under {args.input}")
-    arrays = collect_episodes(roots, image_size=(args.image_width, args.image_height))
+    arrays = collect_episodes(
+        roots,
+        image_size=(args.image_width, args.image_height),
+        min_episode_frames=args.min_episode_frames,
+        skip_bad_episodes=args.skip_bad_episodes,
+    )
     write_zarr(Path(args.output).expanduser(), arrays)
 
 
