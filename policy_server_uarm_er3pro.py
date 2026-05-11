@@ -21,6 +21,16 @@ LATENCY_BUDGET = 0.20
 LATENCY_STEPS = math.ceil(LATENCY_BUDGET / POLICY_CONTROL_PERIOD)
 ACTION_REPEAT = max(1, int(round(POLICY_ACTION_PERIOD / POLICY_CONTROL_PERIOD)))
 PROFILE_INTERVAL = 2.0
+UARM_JOINT_LIMIT_RAD_MIN = np.deg2rad(
+    np.array([-170.0, -120.0, -170.0, -170.0, -170.0, -170.0, -170.0], dtype=np.float64)
+)
+UARM_JOINT_LIMIT_RAD_MAX = np.deg2rad(
+    np.array([170.0, 120.0, 170.0, 170.0, 170.0, 170.0, 170.0], dtype=np.float64)
+)
+UARM_MAX_JOINT_STEP_RAD = np.deg2rad(
+    np.array([6.0, 6.0, 6.0, 9.0, 9.0, 9.0, 9.0], dtype=np.float64)
+)
+UARM_MAX_GRIPPER_STEP = 0.08
 
 
 class UArmEr3ProDiffusionPolicy:
@@ -150,15 +160,69 @@ class UArmEr3ProDiffusionPolicy:
     @staticmethod
     def _convert_action(action, latest_obs):
         act_sequence = []
+        current_joints, current_gripper = UArmEr3ProDiffusionPolicy._current_command_from_obs(latest_obs)
         for act in action:
             act = np.asarray(act, dtype=np.float32)
+            if act.shape[0] < 8:
+                raise ValueError(f"policy action shape {act.shape} does not contain 7 joints + gripper")
+
+            raw_joints = act[:7].astype(np.float64)
+            raw_gripper = act[7:8].astype(np.float64)
+
+            if np.all(np.isfinite(raw_joints)):
+                target_joints = np.clip(raw_joints, UARM_JOINT_LIMIT_RAD_MIN, UARM_JOINT_LIMIT_RAD_MAX)
+                joint_delta = np.clip(
+                    target_joints - current_joints,
+                    -UARM_MAX_JOINT_STEP_RAD,
+                    UARM_MAX_JOINT_STEP_RAD,
+                )
+                current_joints = np.clip(
+                    current_joints + joint_delta,
+                    UARM_JOINT_LIMIT_RAD_MIN,
+                    UARM_JOINT_LIMIT_RAD_MAX,
+                )
+
+            if np.all(np.isfinite(raw_gripper)):
+                target_gripper = float(np.clip(raw_gripper[0], 0.0, 1.0))
+                gripper_delta = np.clip(
+                    target_gripper - current_gripper,
+                    -UARM_MAX_GRIPPER_STEP,
+                    UARM_MAX_GRIPPER_STEP,
+                )
+                current_gripper = float(np.clip(current_gripper + gripper_delta, 0.0, 1.0))
+
             act_sequence.append(
                 {
-                    "arm_joints": act[:7].astype(np.float64),
-                    "gripper_pos": np.asarray(np.clip(act[7:8], 0.0, 1.0), dtype=np.float64),
+                    "arm_joints": current_joints.astype(np.float64).copy(),
+                    "gripper_pos": np.asarray([current_gripper], dtype=np.float64),
                 }
             )
         return act_sequence
+
+    @staticmethod
+    def _current_command_from_obs(obs):
+        if "arm_joints" in obs:
+            joints = np.asarray(obs["arm_joints"], dtype=np.float64).reshape(7)
+        elif "robot_state" in obs:
+            joints = np.asarray(obs["robot_state"], dtype=np.float64).reshape(-1)[:7]
+        else:
+            raise KeyError("missing arm_joints/robot_state needed to safety-filter policy action")
+
+        if "gripper_pos" in obs:
+            gripper = float(np.asarray(obs["gripper_pos"], dtype=np.float64).reshape(-1)[0])
+        elif "robot_state" in obs:
+            gripper = float(np.asarray(obs["robot_state"], dtype=np.float64).reshape(-1)[14])
+        else:
+            gripper = 0.0
+
+        if not np.all(np.isfinite(joints)):
+            raise ValueError(f"latest arm_joints contains non-finite values: {joints}")
+        if not np.isfinite(gripper):
+            gripper = 0.0
+
+        joints = np.clip(joints, UARM_JOINT_LIMIT_RAD_MIN, UARM_JOINT_LIMIT_RAD_MAX)
+        gripper = float(np.clip(gripper, 0.0, 1.0))
+        return joints, gripper
 
     def _record_profile(self, infer_ms):
         self.profile_count += 1
@@ -214,7 +278,6 @@ class PolicyWrapper:
         self.obs_queue.put(obs)
         if self.act_queue.empty():
             self.profile_empty_count += 1
-            print("[uarm_policy] action queue empty; holding this cycle", flush=True)
             return None
         return self.act_queue.get()
 
@@ -277,6 +340,14 @@ class PolicyWrapper:
         now = time.time()
         dt = now - self.profile_last_time
         if dt < PROFILE_INTERVAL:
+            return
+        if (
+            self.profile_infer_count == 0
+            and self.profile_empty_count == 0
+            and self.profile_drop_count == 0
+            and self.act_queue.empty()
+        ):
+            self.profile_last_time = now
             return
         print(
             f"[uarm_queue] infer_hz={self.profile_infer_count / dt:.1f} "
