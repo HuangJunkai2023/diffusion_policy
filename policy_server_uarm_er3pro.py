@@ -40,6 +40,12 @@ class UArmEr3ProDiffusionPolicy:
         self.profile_count = 0
         self.profile_total_ms = 0.0
         self.profile_max_ms = 0.0
+        print("[uarm_policy] checkpoint observation shapes:", flush=True)
+        for key, value in self.obs_shape_meta.items():
+            print(
+                f"  {key}: type={value.get('type', 'low_dim')} shape={list(value['shape'])}",
+                flush=True,
+            )
 
     def reset(self):
         self.policy.reset()
@@ -63,21 +69,59 @@ class UArmEr3ProDiffusionPolicy:
     def _convert_obs(self, obs_sequence):
         obs_dict_np = {}
         for key, value in self.obs_shape_meta.items():
+            if key not in obs_sequence[-1] and key != "robot_state":
+                raise KeyError(f"missing observation key required by checkpoint: {key}")
+
             if value.get("type") == "rgb":
-                images = np.stack([obs[key] for obs in obs_sequence], axis=0)
-                if images.dtype != np.uint8:
-                    raise TypeError(f"{key} must be uint8, got {images.dtype}")
+                target_shape = tuple(value["shape"])
+                images = np.stack(
+                    [self._prepare_rgb_obs(obs[key], target_shape, key) for obs in obs_sequence],
+                    axis=0,
+                )
                 images = images.astype(np.float32) / 255.0
                 images = np.transpose(images, (0, 3, 1, 2))
-                if images.shape[1:] != tuple(value["shape"]):
-                    raise ValueError(f"{key} shape {images.shape[1:]} != {tuple(value['shape'])}")
+                if images.shape[1:] != target_shape:
+                    raise ValueError(f"{key} shape {images.shape[1:]} != {target_shape}")
                 obs_dict_np[key] = images
             elif key == "robot_state":
-                obs_dict_np[key] = np.stack([self._robot_state_from_obs(obs) for obs in obs_sequence], axis=0)
+                robot_state = np.stack([self._robot_state_from_obs(obs) for obs in obs_sequence], axis=0)
+                expected_shape = tuple(value["shape"])
+                if robot_state.shape[1:] != expected_shape:
+                    raise ValueError(f"{key} shape {robot_state.shape[1:]} != {expected_shape}")
+                obs_dict_np[key] = robot_state
             else:
-                obs_dict_np[key] = np.stack([obs[key] for obs in obs_sequence], axis=0).astype(np.float32)
+                low_dim = np.stack([obs[key] for obs in obs_sequence], axis=0).astype(np.float32)
+                expected_shape = tuple(value["shape"])
+                if low_dim.shape[1:] != expected_shape:
+                    raise ValueError(f"{key} shape {low_dim.shape[1:]} != {expected_shape}")
+                obs_dict_np[key] = low_dim
 
         return dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(self.device))
+
+    @staticmethod
+    def _prepare_rgb_obs(image, target_chw_shape, key):
+        if len(target_chw_shape) != 3 or target_chw_shape[0] != 3:
+            raise ValueError(f"{key} expected RGB CHW shape [3, H, W], got {target_chw_shape}")
+
+        image = np.asarray(image)
+        target_h, target_w = target_chw_shape[1], target_chw_shape[2]
+
+        if image.ndim == 3 and image.shape[0] == 3 and image.shape[2] != 3:
+            image = np.transpose(image, (1, 2, 0))
+
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(f"{key} expected HWC RGB image, got shape {image.shape}")
+
+        if image.dtype != np.uint8:
+            if np.issubdtype(image.dtype, np.floating) and image.max(initial=0.0) <= 1.0:
+                image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+            else:
+                image = np.clip(image, 0, 255).astype(np.uint8)
+
+        if image.shape[:2] != (target_h, target_w):
+            image = cv.resize(image, (target_w, target_h), interpolation=cv.INTER_AREA)
+
+        return np.ascontiguousarray(image)
 
     @staticmethod
     def _robot_state_from_obs(obs):
@@ -135,12 +179,19 @@ class PolicyWrapper:
         self.n_action_steps = n_action_steps
         self.obs_queue = queue.Queue()
         self.act_queue = queue.Queue()
+        self.last_error = None
         threading.Thread(target=self.inference_loop, args=(policy,), daemon=True).start()
 
     def reset(self):
+        self.last_error = None
         self.obs_queue.put("reset")
 
     def step(self, obs):
+        if self.last_error is not None:
+            error = self.last_error
+            self.last_error = None
+            raise RuntimeError(f"policy inference loop failed: {error}")
+
         self.obs_queue.put(obs)
         if self.act_queue.empty():
             print("[uarm_policy] action queue empty; holding this cycle", flush=True)
@@ -157,13 +208,23 @@ class PolicyWrapper:
                     policy.reset()
                     obs_history.clear()
                     start_of_episode = True
+                    self.last_error = None
                     while not self.act_queue.empty():
                         self.act_queue.get()
                     continue
                 obs_history.append(obs)
 
             if self.act_queue.qsize() < LATENCY_STEPS and len(obs_history) == self.n_obs_steps:
-                act_sequence = policy.step(list(obs_history))
+                try:
+                    act_sequence = policy.step(list(obs_history))
+                except Exception as e:
+                    self.last_error = e
+                    print(f"[uarm_policy] inference error: {type(e).__name__}: {e}", flush=True)
+                    obs_history.clear()
+                    while not self.act_queue.empty():
+                        self.act_queue.get()
+                    time.sleep(0.1)
+                    continue
                 if start_of_episode:
                     act_sequence = act_sequence[: self.n_action_steps - LATENCY_STEPS]
                     start_of_episode = False
@@ -201,10 +262,15 @@ class PolicyServer:
     def step(self, obs):
         for key, value in list(obs.items()):
             if key.endswith("image"):
-                bgr = cv.imdecode(value, cv.IMREAD_COLOR)
-                if bgr is None:
-                    raise RuntimeError(f"failed to decode image key {key}")
-                obs[key] = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+                if isinstance(value, np.ndarray) and value.dtype == np.uint8 and (
+                    value.ndim == 1 or (value.ndim == 2 and 1 in value.shape)
+                ):
+                    bgr = cv.imdecode(value, cv.IMREAD_COLOR)
+                    if bgr is None:
+                        raise RuntimeError(f"failed to decode image key {key}")
+                    obs[key] = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+                else:
+                    obs[key] = value
         return self.policy.step(obs)
 
 
