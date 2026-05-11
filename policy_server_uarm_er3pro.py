@@ -16,8 +16,10 @@ from diffusion_policy.common.pytorch_util import dict_apply
 
 
 POLICY_CONTROL_PERIOD = 0.05
+POLICY_ACTION_PERIOD = 0.10
 LATENCY_BUDGET = 0.20
 LATENCY_STEPS = math.ceil(LATENCY_BUDGET / POLICY_CONTROL_PERIOD)
+ACTION_REPEAT = max(1, int(round(POLICY_ACTION_PERIOD / POLICY_CONTROL_PERIOD)))
 PROFILE_INTERVAL = 2.0
 
 
@@ -35,6 +37,8 @@ class UArmEr3ProDiffusionPolicy:
         self.device = torch.device(device)
         self.policy = policy.eval().to(self.device)
         self.obs_shape_meta = cfg.shape_meta["obs"]
+        self.n_obs_steps = int(cfg.policy.n_obs_steps)
+        self.n_action_steps = int(cfg.policy.n_action_steps)
         self.warmed_up = False
         self.profile_last_time = time.time()
         self.profile_count = 0
@@ -46,6 +50,11 @@ class UArmEr3ProDiffusionPolicy:
                 f"  {key}: type={value.get('type', 'low_dim')} shape={list(value['shape'])}",
                 flush=True,
             )
+        print(
+            f"[uarm_policy] n_obs_steps={self.n_obs_steps} "
+            f"n_action_steps={self.n_action_steps}",
+            flush=True,
+        )
 
     def reset(self):
         self.policy.reset()
@@ -146,8 +155,6 @@ class UArmEr3ProDiffusionPolicy:
             act_sequence.append(
                 {
                     "arm_joints": act[:7].astype(np.float64),
-                    "arm_pos": np.asarray(latest_obs["arm_pos"], dtype=np.float64).copy(),
-                    "arm_quat": np.asarray(latest_obs["arm_quat"], dtype=np.float64).copy(),
                     "gripper_pos": np.asarray(np.clip(act[7:8], 0.0, 1.0), dtype=np.float64),
                 }
             )
@@ -174,12 +181,24 @@ class UArmEr3ProDiffusionPolicy:
 
 
 class PolicyWrapper:
-    def __init__(self, policy, n_obs_steps=2, n_action_steps=8):
-        self.n_obs_steps = n_obs_steps
-        self.n_action_steps = n_action_steps
+    def __init__(self, policy, n_obs_steps=None, n_action_steps=None, latency_steps=LATENCY_STEPS, action_repeat=ACTION_REPEAT):
+        self.n_obs_steps = int(n_obs_steps if n_obs_steps is not None else policy.n_obs_steps)
+        self.n_action_steps = int(n_action_steps if n_action_steps is not None else policy.n_action_steps)
+        self.latency_steps = int(max(0, latency_steps))
+        self.action_repeat = int(max(1, action_repeat))
         self.obs_queue = queue.Queue()
         self.act_queue = queue.Queue()
         self.last_error = None
+        self.profile_last_time = time.time()
+        self.profile_infer_count = 0
+        self.profile_empty_count = 0
+        self.profile_drop_count = 0
+        print(
+            f"[uarm_policy] wrapper n_obs_steps={self.n_obs_steps} "
+            f"n_action_steps={self.n_action_steps} latency_steps={self.latency_steps} "
+            f"action_repeat={self.action_repeat}",
+            flush=True,
+        )
         threading.Thread(target=self.inference_loop, args=(policy,), daemon=True).start()
 
     def reset(self):
@@ -194,6 +213,7 @@ class PolicyWrapper:
 
         self.obs_queue.put(obs)
         if self.act_queue.empty():
+            self.profile_empty_count += 1
             print("[uarm_policy] action queue empty; holding this cycle", flush=True)
             return None
         return self.act_queue.get()
@@ -202,20 +222,36 @@ class PolicyWrapper:
         obs_history = deque(maxlen=self.n_obs_steps)
         start_of_episode = True
         while True:
-            if not self.obs_queue.empty():
+            latest_obs = None
+            reset_requested = False
+            dropped_obs = 0
+            while not self.obs_queue.empty():
                 obs = self.obs_queue.get()
                 if obs == "reset":
-                    policy.reset()
-                    obs_history.clear()
-                    start_of_episode = True
-                    self.last_error = None
-                    while not self.act_queue.empty():
-                        self.act_queue.get()
-                    continue
-                obs_history.append(obs)
+                    reset_requested = True
+                    latest_obs = None
+                else:
+                    if latest_obs is not None:
+                        dropped_obs += 1
+                    latest_obs = obs
 
-            if self.act_queue.qsize() < LATENCY_STEPS and len(obs_history) == self.n_obs_steps:
+            if dropped_obs:
+                self.profile_drop_count += dropped_obs
+
+            if reset_requested:
+                policy.reset()
+                obs_history.clear()
+                start_of_episode = True
+                self.last_error = None
+                while not self.act_queue.empty():
+                    self.act_queue.get()
+
+            if latest_obs is not None:
+                obs_history.append(latest_obs)
+
+            if self.act_queue.qsize() < self.latency_steps and len(obs_history) == self.n_obs_steps:
                 try:
+                    self.profile_infer_count += 1
                     act_sequence = policy.step(list(obs_history))
                 except Exception as e:
                     self.last_error = e
@@ -226,14 +262,32 @@ class PolicyWrapper:
                     time.sleep(0.1)
                     continue
                 if start_of_episode:
-                    act_sequence = act_sequence[: self.n_action_steps - LATENCY_STEPS]
+                    act_sequence = act_sequence[: max(1, self.n_action_steps - self.latency_steps)]
                     start_of_episode = False
                 else:
-                    act_sequence = act_sequence[LATENCY_STEPS : self.n_action_steps]
+                    act_sequence = act_sequence[self.latency_steps : self.n_action_steps]
                 for action in act_sequence:
-                    self.act_queue.put(action)
+                    for _ in range(self.action_repeat):
+                        self.act_queue.put(action)
 
+            self._maybe_print_profile()
             time.sleep(0.001)
+
+    def _maybe_print_profile(self):
+        now = time.time()
+        dt = now - self.profile_last_time
+        if dt < PROFILE_INTERVAL:
+            return
+        print(
+            f"[uarm_queue] infer_hz={self.profile_infer_count / dt:.1f} "
+            f"queue={self.act_queue.qsize()} empty={self.profile_empty_count} "
+            f"dropped_obs={self.profile_drop_count}",
+            flush=True,
+        )
+        self.profile_last_time = now
+        self.profile_infer_count = 0
+        self.profile_empty_count = 0
+        self.profile_drop_count = 0
 
 
 class PolicyServer:
