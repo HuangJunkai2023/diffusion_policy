@@ -15,9 +15,9 @@ import zmq
 from diffusion_policy.common.pytorch_util import dict_apply
 
 
-POLICY_CONTROL_PERIOD = 0.05
+POLICY_CONTROL_PERIOD = 0.10
 POLICY_ACTION_PERIOD = 0.10
-LATENCY_BUDGET = 0.20
+LATENCY_BUDGET = 0.30
 LATENCY_STEPS = math.ceil(LATENCY_BUDGET / POLICY_CONTROL_PERIOD)
 ACTION_REPEAT = max(1, int(round(POLICY_ACTION_PERIOD / POLICY_CONTROL_PERIOD)))
 PROFILE_INTERVAL = 2.0
@@ -44,6 +44,8 @@ class UArmEr3ProDiffusionPolicy:
         workspace.load_payload(payload)
 
         policy = workspace.ema_model if cfg.training.use_ema else workspace.model
+        if device.startswith("cuda"):
+            torch.backends.cudnn.benchmark = True
         self.device = torch.device(device)
         self.policy = policy.eval().to(self.device)
         self.obs_shape_meta = cfg.shape_meta["obs"]
@@ -71,7 +73,7 @@ class UArmEr3ProDiffusionPolicy:
 
     def step(self, obs_sequence):
         obs_dict = self._convert_obs(obs_sequence)
-        with torch.no_grad():
+        with torch.inference_mode():
             if not self.warmed_up:
                 print("[uarm_policy] warming up", flush=True)
                 self.policy.predict_action(obs_dict)
@@ -245,11 +247,29 @@ class UArmEr3ProDiffusionPolicy:
 
 
 class PolicyWrapper:
-    def __init__(self, policy, n_obs_steps=None, n_action_steps=None, latency_steps=LATENCY_STEPS, action_repeat=ACTION_REPEAT):
+    def __init__(
+        self,
+        policy,
+        n_obs_steps=None,
+        n_action_steps=None,
+        latency_steps=LATENCY_STEPS,
+        action_repeat=ACTION_REPEAT,
+        control_period=POLICY_CONTROL_PERIOD,
+        latency_budget=LATENCY_BUDGET,
+    ):
         self.n_obs_steps = int(n_obs_steps if n_obs_steps is not None else policy.n_obs_steps)
         self.n_action_steps = int(n_action_steps if n_action_steps is not None else policy.n_action_steps)
         self.latency_steps = int(max(0, latency_steps))
+        if self.latency_steps >= self.n_action_steps:
+            print(
+                f"[uarm_policy] latency_steps={self.latency_steps} >= n_action_steps={self.n_action_steps}; "
+                f"clamping to {self.n_action_steps - 1}",
+                flush=True,
+            )
+            self.latency_steps = self.n_action_steps - 1
         self.action_repeat = int(max(1, action_repeat))
+        self.control_period = float(control_period)
+        self.latency_budget = float(latency_budget)
         self.obs_queue = queue.Queue()
         self.act_queue = queue.Queue()
         self.last_error = None
@@ -260,7 +280,8 @@ class PolicyWrapper:
         print(
             f"[uarm_policy] wrapper n_obs_steps={self.n_obs_steps} "
             f"n_action_steps={self.n_action_steps} latency_steps={self.latency_steps} "
-            f"action_repeat={self.action_repeat}",
+            f"action_repeat={self.action_repeat} control_period={self.control_period:.3f}s "
+            f"latency_budget={self.latency_budget:.3f}s",
             flush=True,
         )
         threading.Thread(target=self.inference_loop, args=(policy,), daemon=True).start()
@@ -312,7 +333,7 @@ class PolicyWrapper:
             if latest_obs is not None:
                 obs_history.append(latest_obs)
 
-            if self.act_queue.qsize() < self.latency_steps and len(obs_history) == self.n_obs_steps:
+            if self.act_queue.qsize() <= self.latency_steps and len(obs_history) == self.n_obs_steps:
                 try:
                     self.profile_infer_count += 1
                     act_sequence = policy.step(list(obs_history))
@@ -404,9 +425,34 @@ def main():
     parser.add_argument("--ckpt-path", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--port", type=int, default=5555)
+    parser.add_argument(
+        "--control-period",
+        type=float,
+        default=POLICY_CONTROL_PERIOD,
+        help="Robot policy-control period in seconds. Must match tidybot2 POLICY_CONTROL_PERIOD.",
+    )
+    parser.add_argument(
+        "--latency-budget",
+        type=float,
+        default=LATENCY_BUDGET,
+        help="Latency to hide in seconds. Use ceil(latency_budget / control_period) action steps.",
+    )
     args = parser.parse_args()
 
-    policy = PolicyWrapper(UArmEr3ProDiffusionPolicy(args.ckpt_path, device=args.device))
+    if args.control_period <= 0:
+        raise ValueError("--control-period must be positive")
+    if args.latency_budget < 0:
+        raise ValueError("--latency-budget must be non-negative")
+
+    latency_steps = math.ceil(args.latency_budget / args.control_period)
+    action_repeat = max(1, int(round(POLICY_ACTION_PERIOD / args.control_period)))
+    policy = PolicyWrapper(
+        UArmEr3ProDiffusionPolicy(args.ckpt_path, device=args.device),
+        latency_steps=latency_steps,
+        action_repeat=action_repeat,
+        control_period=args.control_period,
+        latency_budget=args.latency_budget,
+    )
     PolicyServer(policy, port=args.port).run()
 
 
