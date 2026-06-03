@@ -15,9 +15,9 @@ import zmq
 from diffusion_policy.common.pytorch_util import dict_apply
 
 
-POLICY_CONTROL_PERIOD = 0.10
-POLICY_ACTION_PERIOD = 0.10
-LATENCY_BUDGET = 0.30
+POLICY_CONTROL_PERIOD = 0.2
+POLICY_ACTION_PERIOD = 0.2
+LATENCY_BUDGET = 0.35
 LATENCY_STEPS = math.ceil(LATENCY_BUDGET / POLICY_CONTROL_PERIOD)
 ACTION_REPEAT = max(1, int(round(POLICY_ACTION_PERIOD / POLICY_CONTROL_PERIOD)))
 PROFILE_INTERVAL = 2.0
@@ -28,7 +28,7 @@ UARM_JOINT_LIMIT_RAD_MAX = np.deg2rad(
     np.array([170.0, 120.0, 170.0, 170.0, 170.0, 170.0, 170.0], dtype=np.float64)
 )
 UARM_MAX_JOINT_STEP_RAD = np.deg2rad(
-    np.array([6.0, 6.0, 6.0, 9.0, 9.0, 9.0, 9.0], dtype=np.float64)
+    np.array([3.5, 3.5, 3.5, 5.0, 5.0, 5.0, 5.0], dtype=np.float64)
 )
 UARM_MAX_GRIPPER_STEP = 0.08
 
