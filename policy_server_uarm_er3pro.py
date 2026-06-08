@@ -34,7 +34,7 @@ UARM_MAX_GRIPPER_STEP = 0.08
 
 
 class UArmEr3ProDiffusionPolicy:
-    def __init__(self, ckpt_path, device="cuda"):
+    def __init__(self, ckpt_path, device="cuda", num_inference_steps=None):
         with open(ckpt_path, "rb") as f:
             payload = torch.load(f, pickle_module=dill, map_location=device)
 
@@ -48,6 +48,18 @@ class UArmEr3ProDiffusionPolicy:
             torch.backends.cudnn.benchmark = True
         self.device = torch.device(device)
         self.policy = policy.eval().to(self.device)
+        if num_inference_steps is not None:
+            if num_inference_steps <= 0:
+                raise ValueError("--num-inference-steps must be positive")
+            if not hasattr(self.policy, "num_inference_steps"):
+                raise RuntimeError("loaded policy does not expose num_inference_steps")
+            old_num_inference_steps = int(self.policy.num_inference_steps)
+            self.policy.num_inference_steps = int(num_inference_steps)
+            print(
+                f"[uarm_policy] num_inference_steps override: "
+                f"{old_num_inference_steps} -> {self.policy.num_inference_steps}",
+                flush=True,
+            )
         self.obs_shape_meta = cfg.shape_meta["obs"]
         self.n_obs_steps = int(cfg.policy.n_obs_steps)
         self.n_action_steps = int(cfg.policy.n_action_steps)
@@ -437,6 +449,12 @@ def main():
         default=LATENCY_BUDGET,
         help="Latency to hide in seconds. Use ceil(latency_budget / control_period) action steps.",
     )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Override diffusion sampling steps at inference time without retraining.",
+    )
     args = parser.parse_args()
 
     if args.control_period <= 0:
@@ -447,7 +465,11 @@ def main():
     latency_steps = math.ceil(args.latency_budget / args.control_period)
     action_repeat = max(1, int(round(POLICY_ACTION_PERIOD / args.control_period)))
     policy = PolicyWrapper(
-        UArmEr3ProDiffusionPolicy(args.ckpt_path, device=args.device),
+        UArmEr3ProDiffusionPolicy(
+            args.ckpt_path,
+            device=args.device,
+            num_inference_steps=args.num_inference_steps,
+        ),
         latency_steps=latency_steps,
         action_repeat=action_repeat,
         control_period=args.control_period,
