@@ -11,18 +11,18 @@ policy:
   num_inference_steps: 16
   down_dims: [256, 512, 1024]
   obs_encoder:
-    resize_shape: [84, 84]
-    crop_shape: [76, 76]
+    resize_shape: [126, 224]
+    crop_shape: [112, 200]
 
 dataloader:
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   shuffle: False
   pin_memory: True

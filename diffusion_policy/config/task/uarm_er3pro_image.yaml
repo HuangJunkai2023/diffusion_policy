@@ -1,6 +1,6 @@
 name: uarm_er3pro_image
 
-image_shape: &image_shape [3, 84, 84]
+image_shape: &image_shape [3, 126, 224]
 dataset_path: data/uarm_er3pro/uarm_er3pro_replay.zarr
 
 shape_meta: &shape_meta
