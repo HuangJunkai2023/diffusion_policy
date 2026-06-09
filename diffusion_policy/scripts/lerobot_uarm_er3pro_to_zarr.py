@@ -97,9 +97,34 @@ def read_video_frames(root: Path, episode: dict, video_key: str, size: tuple[int
     return np.asarray(frames, dtype=np.uint8)
 
 
+def convert_actions(state: np.ndarray, action: np.ndarray, action_mode: str) -> np.ndarray:
+    if action_mode == "absolute_joint":
+        return action
+    if action_mode != "delta_joint":
+        raise ValueError(f"unsupported action_mode: {action_mode}")
+    if state.shape[1] < 7:
+        raise RuntimeError(f"delta_joint requires robot_state with at least 7 joints, got {state.shape}")
+    if action.shape[1] < 8:
+        raise RuntimeError(f"delta_joint requires action with 7 joints + gripper, got {action.shape}")
+
+    delta_action = action.copy()
+
+    # The policy server reconstructs a predicted horizon by starting from the
+    # latest measured joints and cumulatively applying each delta. Encode the
+    # first command as target-from-current, then subsequent commands as
+    # target-to-target increments so that cumulative sum exactly recovers the
+    # original absolute target sequence.
+    delta_action[0, :7] = action[0, :7] - state[0, :7]
+    if len(action) > 1:
+        delta_action[1:, :7] = np.diff(action[:, :7], axis=0)
+    delta_action[:, 7] = action[:, 7]
+    return delta_action
+
+
 def collect_episodes(
     roots: list[Path],
     image_size: tuple[int, int],
+    action_mode: str,
     min_episode_frames: int = 2,
     skip_bad_episodes: bool = True,
 ):
@@ -132,6 +157,7 @@ def collect_episodes(
                     raise RuntimeError(
                         f"length mismatch: meta={length} state={len(state)} action={len(action)}"
                     )
+                action = convert_actions(state, action, action_mode)
                 base = read_video_frames(root, episode, BASE_VIDEO_KEY, image_size, fps)
                 wrist = read_video_frames(root, episode, WRIST_VIDEO_KEY, image_size, fps)
             except Exception as exc:
@@ -159,13 +185,19 @@ def collect_episodes(
     }
 
 
-def write_zarr(output: Path, arrays: dict):
+def write_zarr(output: Path, arrays: dict, action_mode: str):
     if output.exists():
         shutil.rmtree(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     root = zarr.open(str(output), mode="w")
+    root.attrs["action_mode"] = action_mode
+    if action_mode == "delta_joint":
+        root.attrs["delta_joint_semantics"] = "first_target_minus_state_then_target_increments"
     data_group = root.create_group("data")
     meta_group = root.create_group("meta")
+    meta_group.attrs["action_mode"] = action_mode
+    if action_mode == "delta_joint":
+        meta_group.attrs["delta_joint_semantics"] = "first_target_minus_state_then_target_increments"
     compressor = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
     n = int(arrays["episode_ends"][-1])
 
@@ -178,6 +210,7 @@ def write_zarr(output: Path, arrays: dict):
         print(f"WRITE data/{key}: shape={value.shape} dtype={value.dtype}")
 
     meta_group.array("episode_ends", arrays["episode_ends"], chunks=(len(arrays["episode_ends"]),), overwrite=True)
+    print(f"WRITE meta/action_mode: {action_mode}")
     print(f"WRITE meta/episode_ends: {arrays['episode_ends'].tolist()}")
 
 
@@ -187,6 +220,7 @@ def main():
     parser.add_argument("--output", "-o", default="src/diffusion_policy/data/uarm_er3pro/uarm_er3pro_replay.zarr")
     parser.add_argument("--image-width", type=int, default=224)
     parser.add_argument("--image-height", type=int, default=126)
+    parser.add_argument("--action-mode", choices=("absolute_joint", "delta_joint"), default="absolute_joint")
     parser.add_argument("--min-episode-frames", type=int, default=2)
     parser.add_argument("--skip-bad-episodes", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -197,10 +231,11 @@ def main():
     arrays = collect_episodes(
         roots,
         image_size=(args.image_width, args.image_height),
+        action_mode=args.action_mode,
         min_episode_frames=args.min_episode_frames,
         skip_bad_episodes=args.skip_bad_episodes,
     )
-    write_zarr(Path(args.output).expanduser(), arrays)
+    write_zarr(Path(args.output).expanduser(), arrays, action_mode=args.action_mode)
 
 
 if __name__ == "__main__":

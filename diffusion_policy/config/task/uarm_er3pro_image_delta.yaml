@@ -1,8 +1,8 @@
-name: uarm_er3pro_image
+name: uarm_er3pro_image_delta
 
 image_shape: &image_shape [3, 126, 224]
-dataset_path: data/uarm_er3pro/uarm_er3pro_replay.zarr
-action_mode: absolute_joint
+dataset_path: data/uarm_er3pro/uarm_er3pro_delta_replay.zarr
+action_mode: delta_joint
 
 shape_meta: &shape_meta
   obs:

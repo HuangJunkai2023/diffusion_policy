@@ -1,5 +1,7 @@
 import argparse
 import math
+import os
+from pathlib import Path
 import queue
 import threading
 import time
@@ -34,7 +36,7 @@ UARM_MAX_GRIPPER_STEP = 0.08
 
 
 class UArmEr3ProDiffusionPolicy:
-    def __init__(self, ckpt_path, device="cuda", num_inference_steps=None):
+    def __init__(self, ckpt_path, device="cuda", num_inference_steps=None, action_mode="auto"):
         with open(ckpt_path, "rb") as f:
             payload = torch.load(f, pickle_module=dill, map_location=device)
 
@@ -48,6 +50,7 @@ class UArmEr3ProDiffusionPolicy:
             torch.backends.cudnn.benchmark = True
         self.device = torch.device(device)
         self.policy = policy.eval().to(self.device)
+        self.action_mode = self._resolve_action_mode(cfg, action_mode)
         if num_inference_steps is not None:
             if num_inference_steps <= 0:
                 raise ValueError("--num-inference-steps must be positive")
@@ -76,7 +79,7 @@ class UArmEr3ProDiffusionPolicy:
             )
         print(
             f"[uarm_policy] n_obs_steps={self.n_obs_steps} "
-            f"n_action_steps={self.n_action_steps}",
+            f"n_action_steps={self.n_action_steps} action_mode={self.action_mode}",
             flush=True,
         )
 
@@ -171,8 +174,7 @@ class UArmEr3ProDiffusionPolicy:
             axis=0,
         )
 
-    @staticmethod
-    def _convert_action(action, latest_obs):
+    def _convert_action(self, action, latest_obs):
         act_sequence = []
         current_joints, current_gripper = UArmEr3ProDiffusionPolicy._current_command_from_obs(latest_obs)
         for act in action:
@@ -184,7 +186,13 @@ class UArmEr3ProDiffusionPolicy:
             raw_gripper = act[7:8].astype(np.float64)
 
             if np.all(np.isfinite(raw_joints)):
-                target_joints = np.clip(raw_joints, UARM_JOINT_LIMIT_RAD_MIN, UARM_JOINT_LIMIT_RAD_MAX)
+                if self.action_mode == "absolute_joint":
+                    target_joints = raw_joints
+                elif self.action_mode == "delta_joint":
+                    target_joints = current_joints + raw_joints
+                else:
+                    raise RuntimeError(f"unsupported action_mode: {self.action_mode}")
+                target_joints = np.clip(target_joints, UARM_JOINT_LIMIT_RAD_MIN, UARM_JOINT_LIMIT_RAD_MAX)
                 joint_delta = np.clip(
                     target_joints - current_joints,
                     -UARM_MAX_JOINT_STEP_RAD,
@@ -237,6 +245,58 @@ class UArmEr3ProDiffusionPolicy:
         joints = np.clip(joints, UARM_JOINT_LIMIT_RAD_MIN, UARM_JOINT_LIMIT_RAD_MAX)
         gripper = float(np.clip(gripper, 0.0, 1.0))
         return joints, gripper
+
+    @staticmethod
+    def _resolve_action_mode(cfg, requested_action_mode):
+        cfg_action_mode = None
+        if "task" in cfg and cfg.task is not None:
+            cfg_action_mode = cfg.task.get("action_mode", None)
+        if cfg_action_mode is None:
+            cfg_action_mode = UArmEr3ProDiffusionPolicy._read_zarr_action_mode(cfg)
+
+        valid_modes = {"absolute_joint", "delta_joint"}
+        if cfg_action_mode is not None and cfg_action_mode not in valid_modes:
+            raise RuntimeError(f"checkpoint has unsupported action_mode: {cfg_action_mode}")
+
+        if requested_action_mode == "auto":
+            resolved = cfg_action_mode or "absolute_joint"
+        else:
+            resolved = requested_action_mode
+            if cfg_action_mode is not None and cfg_action_mode != resolved:
+                raise RuntimeError(
+                    f"requested action_mode={resolved} does not match checkpoint action_mode={cfg_action_mode}"
+                )
+
+        print(
+            f"[uarm_policy] action_mode={resolved} "
+            f"(checkpoint={cfg_action_mode or 'missing'}, requested={requested_action_mode})",
+            flush=True,
+        )
+        return resolved
+
+    @staticmethod
+    def _read_zarr_action_mode(cfg):
+        if "task" not in cfg or cfg.task is None:
+            return None
+        dataset_path = cfg.task.get("dataset_path", None)
+        if dataset_path is None:
+            return None
+        path = Path(os.path.expanduser(str(dataset_path)))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            return None
+        try:
+            import zarr
+
+            root = zarr.open(str(path), mode="r")
+            action_mode = root.attrs.get("action_mode", None)
+            if action_mode is None and "meta" in root:
+                action_mode = root["meta"].attrs.get("action_mode", None)
+            return action_mode
+        except Exception as exc:
+            print(f"[uarm_policy] could not read zarr action_mode from {path}: {exc}", flush=True)
+            return None
 
     def _record_profile(self, infer_ms):
         self.profile_count += 1
@@ -455,6 +515,12 @@ def main():
         default=None,
         help="Override diffusion sampling steps at inference time without retraining.",
     )
+    parser.add_argument(
+        "--action-mode",
+        choices=("auto", "absolute_joint", "delta_joint"),
+        default="auto",
+        help="How to interpret policy actions. Auto uses checkpoint/zarr metadata and falls back to absolute_joint.",
+    )
     args = parser.parse_args()
 
     if args.control_period <= 0:
@@ -469,6 +535,7 @@ def main():
             args.ckpt_path,
             device=args.device,
             num_inference_steps=args.num_inference_steps,
+            action_mode=args.action_mode,
         ),
         latency_steps=latency_steps,
         action_repeat=action_repeat,
